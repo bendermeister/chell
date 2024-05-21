@@ -186,7 +186,7 @@ static int db_fetch_should_run(char *key, char *dep) {
 
   struct stat s;
   int err = stat(dep, &s);
-  if (err || s.st_mtimensec > (unsigned long)e->value) {
+  if (err || s.st_mtime > e->value) {
     e->state = DB_RUNNING;
     mtx_unlock(&db.mtx);
     return 1;
@@ -324,7 +324,6 @@ void db_init(void) {
         .state = DB_COMPLETE,
         .key = line,
     };
-    sscanf(line, "%ld", &e->value);
     (*curr) = e;
     curr = &e->next;
     line = end;
@@ -339,7 +338,10 @@ void db_init(void) {
     int cap = 0;
     char *buf = NULL;
     scat(&buf, &len, &cap, iter->key);
-    *strrchr(buf, ' ') = 0;
+    char *s = strrchr(buf, ' ');
+    *s = 0;
+    s += 1;
+    iter->value = atoll(s);
     iter->key = buf;
   }
   free(f);

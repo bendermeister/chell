@@ -7,11 +7,11 @@ void all(void) {
 
   async_command(&wg, "clang",
                 COMBINE(FLAGS, LIST("main.c", "-c", "-o", "main.o")),
-                LIST("main.c", "lib.h"));
+                LIST("main.c", "lib.h", "main.o"));
 
   async_command(&wg, "clang",
                 COMBINE(FLAGS, LIST("lib.c", "-c", "-o", "lib.o")),
-                LIST("lib.c", "lib.h"));
+                LIST("lib.c", "lib.h", "lib.o"));
 
   wg_wait(&wg);
 
