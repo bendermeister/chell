@@ -1,0 +1,3 @@
+clang -Wall -Wextra -g main.c -c -o main.o 1716300790
+clang -Wall -Wextra -g lib.c -c -o lib.o 1716300790
+clang -Wall -Wextra -g main.o lib.o -o a.out 1716300790

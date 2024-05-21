@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <threads.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,7 +18,7 @@
 #endif // CHELL_FILE
 
 #ifndef THREADS
-#define THREADS 8
+#define THREADS 1
 #endif // THREADS
 
 //=================================UTIL========================================
@@ -110,7 +112,26 @@ static list_t *list_create(char **elements) {
   return list;
 }
 
+typedef enum { DB_RUNNING, DB_COMPLETE } db_entry_state_t;
+
+typedef struct db_entry_t db_entry_t;
+struct db_entry_t {
+  char *key;
+  time_t value;
+  db_entry_t *next;
+  db_entry_state_t state;
+};
+
+struct {
+  mtx_t mtx;
+  cnd_t cnd;
+  db_entry_t *db;
+} db = {0};
+
 static void list_destroy(list_t *l) {
+  if (!l) {
+    return;
+  }
   free(l->buf);
   free(l);
 }
@@ -138,6 +159,52 @@ static list_t *list_combine(list_t *lists[]) {
   return l;
 }
 
+db_entry_t **db_find(db_entry_t **e, char *key);
+
+static int db_fetch_should_run(char *key, char *dep) {
+  mtx_lock(&db.mtx);
+  db_entry_t **ee = db_find(&db.db, key);
+  db_entry_t *e = *ee;
+
+  if (!e) {
+    int len = 0;
+    int cap = 0;
+    char *buf = NULL;
+    scat(&buf, &len, &cap, key);
+    e = xmalloc(sizeof(*e));
+    e->key = buf;
+    e->next = NULL;
+    e->state = DB_RUNNING;
+    *ee = e;
+    mtx_unlock(&db.mtx);
+    return 1;
+  }
+
+  while (e->state == DB_RUNNING) {
+    cnd_wait(&db.cnd, &db.mtx);
+  }
+
+  struct stat s;
+  int err = stat(dep, &s);
+  if (err || s.st_mtimensec > (unsigned long)e->value) {
+    e->state = DB_RUNNING;
+    mtx_unlock(&db.mtx);
+    return 1;
+  }
+
+  mtx_unlock(&db.mtx);
+  return 0;
+}
+
+static void db_update(char *key) {
+  mtx_lock(&db.mtx);
+  db_entry_t *e = *db_find(&db.db, key);
+  e->state = DB_COMPLETE;
+  e->value = time(NULL);
+  mtx_unlock(&db.mtx);
+  cnd_broadcast(&db.cnd);
+}
+
 static void command(char *program, list_t *args, list_t *deps) {
   char *buf = NULL;
   int len = 0;
@@ -153,15 +220,129 @@ static void command(char *program, list_t *args, list_t *deps) {
     scat(&buf, &len, &cap, arg);
   }
 
-  LOG("running `%s`", buf);
-  int err = system(buf);
-  if (err) {
-    ERROR("command '%s' exited with non zero exit code", buf);
+  int should = deps == NULL;
+  for (int i = 0; !should && i < deps->len; ++i) {
+    if (db_fetch_should_run(buf, deps->buf[i])) {
+      should = 1;
+    }
   }
 
-  list_destroy(args);
+  if (should) {
+    LOG("running `%s`", buf);
+    int err = system(buf);
+    if (err) {
+      ERROR("command '%s' exited with non zero exit code", buf);
+    }
+    if (deps != NULL) {
+      db_update(buf);
+    }
+  }
+
   list_destroy(deps);
+  list_destroy(args);
   free(buf);
+}
+//=================================ACTOR=======================================
+
+db_entry_t **db_find(db_entry_t **e, char *key) {
+  db_entry_t *ee = *e;
+  if (!ee) {
+    return e;
+  }
+  if (strlen(ee->key) == strlen(key) && strcmp(ee->key, key) == 0) {
+    return e;
+  }
+  return db_find(&ee->next, key);
+}
+
+void db_deinit_write(db_entry_t *e, FILE *f) {
+  if (!e) {
+    return;
+  }
+  fprintf(f, "%s %ld\n", e->key, e->value);
+  free(e->key);
+  db_deinit_write(e->next, f);
+  free(e);
+}
+
+void db_deinit(void) {
+  FILE *f = fopen(CHELL_FILE, "w");
+  if (!f) {
+    ERROR("could not deinitilize chell: %s", strerror(errno));
+  }
+  db_deinit_write(db.db, f);
+  fclose(f);
+}
+
+char *read_file(char *path) {
+  ssize_t cap = 1024;
+  ssize_t len = 0;
+  char *buffer = xmalloc(cap);
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    ERROR("could not read file %s: %s", path, strerror(errno));
+  }
+
+  while (!ferror(f) && !feof(f)) {
+    ssize_t nread = fread(buffer + len, 1, cap - len, f);
+    if (nread < 0) {
+      ERROR("could not read file %s: %s", path, strerror(errno));
+    }
+    len += nread;
+    cap *= 2;
+    buffer = xrealloc(buffer, cap);
+  }
+  buffer[len] = 0;
+  fclose(f);
+  return buffer;
+}
+
+void db_init(void) {
+  int err;
+  err = mtx_init(&db.mtx, mtx_plain);
+  if (err != thrd_success) {
+    ERROR("could not initilize actor: %s", strerror(errno));
+  }
+
+  err = cnd_init(&db.cnd);
+  if (err != thrd_success) {
+    ERROR("could not initilize actor: %s", strerror(errno));
+  }
+
+  db_entry_t **curr = &db.db;
+
+  char *f = read_file(CHELL_FILE);
+  char *line = f;
+  while (line) {
+    char *end = strchr(line, '\n');
+    if (!end) {
+      break;
+    }
+    *end = 0;
+    db_entry_t *e = xmalloc(sizeof(*e));
+    *e = (db_entry_t){
+        .state = DB_COMPLETE,
+        .key = line,
+    };
+    sscanf(line, "%ld", &e->value);
+    (*curr) = e;
+    curr = &e->next;
+    line = end;
+    if (end) {
+      line += 1;
+    }
+  }
+
+  db_entry_t *iter = db.db;
+  for (; iter; iter = iter->next) {
+    int len = 0;
+    int cap = 0;
+    char *buf = NULL;
+    scat(&buf, &len, &cap, iter->key);
+    *strrchr(buf, ' ') = 0;
+    iter->key = buf;
+  }
+  free(f);
 }
 
 //=================================THREADING===================================
@@ -206,6 +387,7 @@ static int worker_(void *a) {
       mtx_unlock(&pool.mtx);
       command(work->program, work->args, work->deps);
       wg_done(work->wg);
+      free(work);
     } else {
       mtx_unlock(&pool.mtx);
       return 0;
@@ -223,6 +405,8 @@ void work_yield(void) {
 
   if (work) {
     command(work->program, work->args, work->deps);
+    wg_done(work->wg);
+    free(work);
   }
 }
 
@@ -239,6 +423,7 @@ static void wg_wait(wg_t *w) {
 }
 
 static void async_command(wg_t *wg, char *program, list_t *args, list_t *deps) {
+  wg_add(wg, 1);
   work_t *work;
   size_t size = MAX(sizeof(*work), 64);
   work = xmalloc(size);
@@ -257,7 +442,9 @@ static void async_command(wg_t *wg, char *program, list_t *args, list_t *deps) {
 
 //=================================INIT========================================
 static void chell_init(void) {
+  db_init();
   int err;
+  pool.alive = 1;
   err = cnd_init(&pool.cnd);
   if (err) {
     ERROR("could not initilize chell");
@@ -268,8 +455,8 @@ static void chell_init(void) {
   }
   for (int i = 0; i < THREADS; ++i) {
     err = thrd_create(&pool.tids[i], worker_, NULL);
-    if (err) {
-      ERROR("could not start worker thread");
+    if (err != 0) {
+      ERROR("could not start worker thread: %s", strerror(errno));
     }
   }
 }
@@ -282,6 +469,7 @@ static void chell_deinit(void) {
   for (int i = 0; i < THREADS; ++i) {
     thrd_join(pool.tids[i], NULL);
   }
+  db_deinit();
 }
 
 #endif // CHELL_H
