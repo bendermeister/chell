@@ -22,7 +22,7 @@ void all(void) {
 void clean(void) { command("rm", LIST("-f", "*.o", "a.out"), NULL); }
 
 int main(int argc, char *argv[argc]) {
-  chell_init();
+  chell_init(argc, argv);
 
   if (argc == 1 || strcmp(argv[1], "all") == 0) {
     all();

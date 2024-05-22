@@ -1,6 +1,18 @@
 #ifndef CHELL_H
 #define CHELL_H
 
+#ifndef CHELL_SRC
+#define CHELL_SRC "chell.c"
+#endif // CHEL_SRC
+
+#ifndef CHELL_REBUILT_ARGS
+#define CHELL_REBUILT_ARGS "-g -Wall -Wextra -std=c17"
+#endif // CHELL_REBUILT_ARGS
+
+#ifndef CHELL_CC
+#define CHELL_CC "clang"
+#endif // CHEL_CC
+
 #include <errno.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -278,7 +290,7 @@ char *read_file(char *path) {
   ssize_t cap = 1024;
   ssize_t len = 0;
   char *buffer = xmalloc(cap);
-  FILE *f = fopen(path, "r");
+  FILE *f = fopen(path, "r+");
   if (!f) {
     ERROR("could not read file %s: %s", path, strerror(errno));
   }
@@ -371,7 +383,7 @@ struct {
 } pool = {0};
 
 static void wg_done(wg_t *w) {
-  atomic_fetch_sub_explicit(&w->counter, 1, memory_order_acquire);
+  atomic_fetch_sub_explicit(&w->counter, 1, memory_order_acq_rel);
 }
 
 static int worker_(void *a) {
@@ -441,9 +453,45 @@ static void async_command(wg_t *wg, char *program, list_t *args, list_t *deps) {
   mtx_unlock(&pool.mtx);
   cnd_signal(&pool.cnd);
 }
+//=================================REBUILT=====================================
+static void chell_rebuilt_yourself(int argc, char **argv) {
+  struct stat d;
+  struct stat s;
+  stat(argv[0], &d);
+  stat(CHELL_SRC, &s);
+  if (d.st_mtime > s.st_mtime) {
+    return;
+  }
+
+  LOG("rebuilding chell");
+  char *buf = NULL;
+  int len = 0;
+  int cap = 0;
+
+  scat(&buf, &len, &cap, CHELL_CC);
+  scat(&buf, &len, &cap, " ");
+  scat(&buf, &len, &cap, CHELL_REBUILT_ARGS);
+  scat(&buf, &len, &cap, " ");
+  scat(&buf, &len, &cap, CHELL_SRC);
+  scat(&buf, &len, &cap, " ");
+  scat(&buf, &len, &cap, " -o ");
+  scat(&buf, &len, &cap, argv[0]);
+
+  int err = system(buf);
+  if (err) {
+    ERROR("could not rebuilt chell");
+  }
+  err = execv(argv[0], argv);
+  if (err) {
+    ERROR("could not rerun chell");
+  }
+  free(buf);
+  exit(0);
+}
 
 //=================================INIT========================================
-static void chell_init(void) {
+static void chell_init(int argc, char *argv[argc]) {
+  chell_rebuilt_yourself(argc, argv);
   db_init();
   int err;
   pool.alive = 1;
